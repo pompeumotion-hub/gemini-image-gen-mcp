@@ -19,6 +19,18 @@ function ensureDir(dir) {
   }
 }
 
+async function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function parseResponse(response, outputDir, filenamePrefix) {
   const candidate = response?.candidates?.[0];
   if (!candidate) {
@@ -51,22 +63,28 @@ function parseResponse(response, outputDir, filenamePrefix) {
   return { images, text };
 }
 
-export async function generateImage({ prompt, aspectRatio = "1:1", outputDir = DEFAULT_OUTPUT_DIR }) {
+export async function generateImage({ prompt, aspectRatio, outputDir = DEFAULT_OUTPUT_DIR }) {
+  if (!prompt || !prompt.trim()) throw new Error("prompt is required");
   ensureDir(outputDir);
   const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
 
-  const result = await Promise.race([
-    new Promise((_, rej) => setTimeout(() => rej(new Error("Gemini API timed out after 120s")), 120000)),
+  const generationConfig = { responseModalities: ["image", "text"] };
+  if (aspectRatio) generationConfig.imageConfig = { aspectRatio };
+
+  const result = await withTimeout(
     model.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { responseModalities: ["image", "text"] },
+      generationConfig,
     }),
-  ]);
+    120000,
+    "Gemini generateImage"
+  );
 
   return parseResponse(result.response, outputDir, "gemini");
 }
 
-export async function editImage({ imagePath, imageBase64, imageMimeType, prompt, outputDir = DEFAULT_OUTPUT_DIR }) {
+export async function editImage({ imagePath, imageBase64, imageMimeType, prompt, aspectRatio, outputDir = DEFAULT_OUTPUT_DIR }) {
+  if (!prompt || !prompt.trim()) throw new Error("prompt is required");
   ensureDir(outputDir);
 
   let base64, mimeType;
@@ -87,8 +105,10 @@ export async function editImage({ imagePath, imageBase64, imageMimeType, prompt,
 
   const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
 
-  const result = await Promise.race([
-    new Promise((_, rej) => setTimeout(() => rej(new Error("Gemini API timed out after 120s")), 120000)),
+  const generationConfig = { responseModalities: ["image", "text"] };
+  if (aspectRatio) generationConfig.imageConfig = { aspectRatio };
+
+  const result = await withTimeout(
     model.generateContent({
       contents: [
         {
@@ -99,9 +119,11 @@ export async function editImage({ imagePath, imageBase64, imageMimeType, prompt,
           ],
         },
       ],
-      generationConfig: { responseModalities: ["image", "text"] },
+      generationConfig,
     }),
-  ]);
+    120000,
+    "Gemini editImage"
+  );
 
   return parseResponse(result.response, outputDir, "edited");
 }
