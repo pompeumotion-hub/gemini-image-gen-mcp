@@ -4,52 +4,76 @@ import path from "path";
 import os from "os";
 
 const DEFAULT_OUTPUT_DIR = path.join(os.homedir(), "gemini-outputs");
-fs.mkdirSync(DEFAULT_OUTPUT_DIR, { recursive: true });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+function getClient() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("GEMINI_API_KEY is not set in environment");
+  return new GoogleGenerativeAI(key);
+}
 
-export async function generateImage({ prompt, aspectRatio = "1:1", outputDir = DEFAULT_OUTPUT_DIR }) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image" });
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    throw new Error(`Cannot create output directory "${dir}": ${err.message}`);
+  }
+}
 
-  const result = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseModalities: ["image", "text"],
-    },
-  });
+function parseResponse(response, outputDir, filenamePrefix) {
+  const candidate = response?.candidates?.[0];
+  if (!candidate) {
+    const block = response?.promptFeedback?.blockReason;
+    throw new Error(block ? `Gemini blocked the request: ${block}` : "Gemini returned no candidates");
+  }
 
-  const response = result.response;
+  const parts = candidate.content?.parts ?? [];
   const images = [];
 
-  for (const part of response.candidates[0].content.parts) {
+  for (const part of parts) {
     if (part.inlineData?.mimeType?.startsWith("image/")) {
-      const ext = part.inlineData.mimeType.split("/")[1];
-      const filename = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-
-      fs.mkdirSync(outputDir, { recursive: true });
+      const ext = (part.inlineData.mimeType.split("/")[1] || "png").split("+")[0];
+      const filename = `${filenamePrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const filepath = path.join(outputDir, filename);
       fs.writeFileSync(filepath, Buffer.from(part.inlineData.data, "base64"));
-
       images.push({ filename, filepath, mimeType: part.inlineData.mimeType, base64: part.inlineData.data });
     }
   }
 
-  const text = response.candidates[0].content.parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
+  const text = parts.filter((p) => p.text).map((p) => p.text).join("\n");
+
+  if (images.length === 0) {
+    const finishReason = candidate.finishReason;
+    if (finishReason && finishReason !== "STOP") {
+      throw new Error(`Gemini did not return an image (finishReason: ${finishReason})${text ? `. Response: ${text}` : ""}`);
+    }
+  }
 
   return { images, text };
 }
 
+export async function generateImage({ prompt, aspectRatio = "1:1", outputDir = DEFAULT_OUTPUT_DIR }) {
+  ensureDir(outputDir);
+  const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
+
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { responseModalities: ["image", "text"] },
+  });
+
+  return parseResponse(result.response, outputDir, "gemini");
+}
+
 export async function editImage({ imagePath, imageBase64, imageMimeType, prompt, outputDir = DEFAULT_OUTPUT_DIR }) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image" });
+  ensureDir(outputDir);
 
   let base64, mimeType;
   if (imageBase64) {
-    base64 = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+    base64 = imageBase64.replace(/^data:image\/[\w.+-]+;base64,/, "");
     mimeType = imageMimeType || "image/png";
   } else if (imagePath) {
+    if (!fs.existsSync(imagePath)) {
+      throw new Error(`Source image not found: ${imagePath}`);
+    }
     const imageData = fs.readFileSync(imagePath);
     base64 = imageData.toString("base64");
     const ext = path.extname(imagePath).toLowerCase();
@@ -57,6 +81,8 @@ export async function editImage({ imagePath, imageBase64, imageMimeType, prompt,
   } else {
     throw new Error("Either imagePath or imageBase64 is required");
   }
+
+  const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
 
   const result = await model.generateContent({
     contents: [
@@ -71,24 +97,5 @@ export async function editImage({ imagePath, imageBase64, imageMimeType, prompt,
     generationConfig: { responseModalities: ["image", "text"] },
   });
 
-  const response = result.response;
-  const images = [];
-
-  for (const part of response.candidates[0].content.parts) {
-    if (part.inlineData?.mimeType?.startsWith("image/")) {
-      const ext = part.inlineData.mimeType.split("/")[1];
-      const filename = `edited_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.mkdirSync(outputDir, { recursive: true });
-      const filepath = path.join(outputDir, filename);
-      fs.writeFileSync(filepath, Buffer.from(part.inlineData.data, "base64"));
-      images.push({ filename, filepath, mimeType: part.inlineData.mimeType, base64: part.inlineData.data });
-    }
-  }
-
-  const text = response.candidates[0].content.parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
-
-  return { images, text };
+  return parseResponse(result.response, outputDir, "edited");
 }
