@@ -147,7 +147,7 @@ app.post("/api/edit", upload.single("image"), async (req, res) => {
     if (!images.length) return res.status(500).json({ error: "No image returned", text });
     res.json({ filename: images[0].filename, filepath: images[0].filepath, text });
   } catch (err) {
-    if (file?.path) fs.unlinkSync(file.path).catch?.(() => {});
+    if (file?.path) try { fs.unlinkSync(file.path); } catch (_) {}
     res.status(500).json({ error: err.message });
   }
 });
