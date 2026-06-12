@@ -4,15 +4,21 @@ import cors from "cors";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { generateImage, editImage } from "./gemini-client.js";
+
+const OUTPUT_DIR = path.join(os.homedir(), "gemini-outputs");
+const UPLOAD_DIR = path.join(os.tmpdir(), "gemini-uploads");
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 const port = process.env.PORT ?? 3000;
-const upload = multer({ dest: "./uploads/" });
+const upload = multer({ dest: UPLOAD_DIR });
 
 app.use(cors());
-app.use(express.json());
-app.use("/outputs", express.static(path.resolve("./outputs")));
+app.use(express.json({ limit: "20mb" }));
+app.use("/outputs", express.static(OUTPUT_DIR));
 
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -142,12 +148,17 @@ app.post("/api/edit", upload.single("image"), async (req, res) => {
   const file = req.file;
   if (!file || !prompt) return res.status(400).json({ error: "image and prompt are required" });
   try {
-    const { images, text } = await editImage({ imagePath: file.path, prompt });
+    const imageData = fs.readFileSync(file.path);
+    const { images, text } = await editImage({
+      imageBase64: imageData.toString("base64"),
+      imageMimeType: file.mimetype || "image/png",
+      prompt,
+    });
     fs.unlinkSync(file.path);
     if (!images.length) return res.status(500).json({ error: "No image returned", text });
     res.json({ filename: images[0].filename, filepath: images[0].filepath, text });
   } catch (err) {
-    if (file?.path) fs.unlinkSync(file.path).catch?.(() => {});
+    if (file?.path) try { fs.unlinkSync(file.path); } catch (_) {}
     res.status(500).json({ error: err.message });
   }
 });

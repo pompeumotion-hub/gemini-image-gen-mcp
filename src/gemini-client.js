@@ -1,81 +1,129 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fs from "fs";
 import path from "path";
+import os from "os";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const DEFAULT_OUTPUT_DIR = path.join(os.homedir(), "gemini-outputs");
 
-export async function generateImage({ prompt, aspectRatio = "1:1", outputDir = "./outputs" }) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp-image-generation" });
+function getClient() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("GEMINI_API_KEY is not set in environment");
+  return new GoogleGenerativeAI(key);
+}
 
-  const result = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseModalities: ["image", "text"],
-    },
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    throw new Error(`Cannot create output directory "${dir}": ${err.message}`);
+  }
+}
+
+async function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-  const response = result.response;
+function parseResponse(response, outputDir, filenamePrefix) {
+  const candidate = response?.candidates?.[0];
+  if (!candidate) {
+    const block = response?.promptFeedback?.blockReason;
+    throw new Error(block ? `Gemini blocked the request: ${block}` : "Gemini returned no candidates");
+  }
+
+  const parts = candidate.content?.parts ?? [];
   const images = [];
 
-  for (const part of response.candidates[0].content.parts) {
+  for (const part of parts) {
     if (part.inlineData?.mimeType?.startsWith("image/")) {
-      const ext = part.inlineData.mimeType.split("/")[1];
-      const filename = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-
-      fs.mkdirSync(outputDir, { recursive: true });
+      const ext = (part.inlineData.mimeType.split("/")[1] || "png").split("+")[0];
+      const filename = `${filenamePrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const filepath = path.join(outputDir, filename);
       fs.writeFileSync(filepath, Buffer.from(part.inlineData.data, "base64"));
-
       images.push({ filename, filepath, mimeType: part.inlineData.mimeType, base64: part.inlineData.data });
     }
   }
 
-  const text = response.candidates[0].content.parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
+  const text = parts.filter((p) => p.text).map((p) => p.text).join("\n");
+
+  if (images.length === 0) {
+    const finishReason = candidate.finishReason;
+    if (finishReason && finishReason !== "STOP") {
+      throw new Error(`Gemini did not return an image (finishReason: ${finishReason})${text ? `. Response: ${text}` : ""}`);
+    }
+  }
 
   return { images, text };
 }
 
-export async function editImage({ imagePath, prompt, outputDir = "./outputs" }) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp-image-generation" });
+export async function generateImage({ prompt, aspectRatio, outputDir = DEFAULT_OUTPUT_DIR }) {
+  if (!prompt || !prompt.trim()) throw new Error("prompt is required");
+  ensureDir(outputDir);
+  const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
 
-  const imageData = fs.readFileSync(imagePath);
-  const base64 = imageData.toString("base64");
-  const mimeType = imagePath.endsWith(".png") ? "image/png" : "image/jpeg";
+  const generationConfig = { responseModalities: ["image", "text"] };
+  if (aspectRatio) generationConfig.imageConfig = { aspectRatio };
 
-  const result = await model.generateContent({
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { inlineData: { mimeType, data: base64 } },
-          { text: prompt },
-        ],
-      },
-    ],
-    generationConfig: { responseModalities: ["image", "text"] },
-  });
+  const result = await withTimeout(
+    model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig,
+    }),
+    120000,
+    "Gemini generateImage"
+  );
 
-  const response = result.response;
-  const images = [];
+  return parseResponse(result.response, outputDir, "gemini");
+}
 
-  for (const part of response.candidates[0].content.parts) {
-    if (part.inlineData?.mimeType?.startsWith("image/")) {
-      const ext = part.inlineData.mimeType.split("/")[1];
-      const filename = `edited_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.mkdirSync(outputDir, { recursive: true });
-      const filepath = path.join(outputDir, filename);
-      fs.writeFileSync(filepath, Buffer.from(part.inlineData.data, "base64"));
-      images.push({ filename, filepath, mimeType: part.inlineData.mimeType, base64: part.inlineData.data });
+export async function editImage({ imagePath, imageBase64, imageMimeType, prompt, aspectRatio, outputDir = DEFAULT_OUTPUT_DIR }) {
+  if (!prompt || !prompt.trim()) throw new Error("prompt is required");
+  ensureDir(outputDir);
+
+  let base64, mimeType;
+  if (imageBase64) {
+    base64 = imageBase64.replace(/^data:image\/[\w.+-]+;base64,/, "");
+    mimeType = imageMimeType || "image/png";
+  } else if (imagePath) {
+    if (!fs.existsSync(imagePath)) {
+      throw new Error(`Source image not found: ${imagePath}`);
     }
+    const imageData = fs.readFileSync(imagePath);
+    base64 = imageData.toString("base64");
+    const ext = path.extname(imagePath).toLowerCase();
+    mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+  } else {
+    throw new Error("Either imagePath or imageBase64 is required");
   }
 
-  const text = response.candidates[0].content.parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
+  const model = getClient().getGenerativeModel({ model: "gemini-2.5-flash-image" });
 
-  return { images, text };
+  const generationConfig = { responseModalities: ["image", "text"] };
+  if (aspectRatio) generationConfig.imageConfig = { aspectRatio };
+
+  const result = await withTimeout(
+    model.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { inlineData: { mimeType, data: base64 } },
+            { text: prompt },
+          ],
+        },
+      ],
+      generationConfig,
+    }),
+    120000,
+    "Gemini editImage"
+  );
+
+  return parseResponse(result.response, outputDir, "edited");
 }
